@@ -1,6 +1,8 @@
 * this is a modified image to fit cube hostings needs.
 * you can find the original version at https://github.com/lloesche/valheim-server-docker
 * ssh has been added on port 22.
+* sync settings
+	* /config/worlds_local
 
 # lloesche/valheim-server Docker image
 ![Valheim](https://raw.githubusercontent.com/lloesche/valheim-server-docker/main/misc/Logo_valheim.png "Valheim")
