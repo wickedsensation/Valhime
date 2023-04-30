@@ -1,3 +1,6 @@
+this is a modified image to fit cube hostings needs 
+you can find the original author at https://github.com/lloesche/valheim-server-docker
+
 # lloesche/valheim-server Docker image
 ![Valheim](https://raw.githubusercontent.com/lloesche/valheim-server-docker/main/misc/Logo_valheim.png "Valheim")
 
