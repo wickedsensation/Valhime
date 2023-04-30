@@ -1,0 +1,306 @@
+#!/bin/bash
+# valheim-updater runs on startup and
+# periodically checks for server updates.
+# It is also responsible for (re)starting
+# the valheim-server service.
+
+# Include defaults
+. /usr/local/etc/valheim/defaults
+. /usr/local/etc/valheim/common
+
+debug "Running Valheim Server updater as user $USER uid $UID"
+cd /opt/steamcmd || fatal "Could not cd /opt/steamcmd"
+pidfile=$valheim_updater_pidfile
+next_update=$(date +%s)
+run=true
+
+
+main() {
+    if (set -o noclobber; echo $$ > "$pidfile") 2> /dev/null; then
+        trap update_now SIGHUP
+        trap shutdown SIGINT SIGTERM
+        trap 'error_handler $? $LINENO $BASH_LINENO "$BASH_COMMAND" $(printf "::%s" ${FUNCNAME[@]}); trap - ERR' ERR
+        while [ $run = true ]; do
+            ensure_permissions
+            verify_kernel
+            verify_cpu_mhz
+            verify_memory
+            verify_storage
+            update
+            check_server_restart
+            next_update=$(($(date +%s)+UPDATE_INTERVAL))
+            while [ $run = true ] && [ "$(date +%s)" -lt $next_update ]; do
+                sleep 9
+            done
+        done
+    else
+        info "Found existing PID file - checking process"
+        check_lock $pidfile
+    fi
+}
+
+
+update() {
+    local logfile
+    if ! is_idle; then
+        return
+    fi
+    pre_update_check_hook
+    logfile="$(mktemp)"
+    info "Downloading/updating/validating Valheim server from Steam"
+    if ! download_valheim; then
+        if [ -f "$valheim_download_path/valheim_server.x86_64" ]; then
+            error "Failed to update Valheim server from Steam - however an existing version was found locally - using it"
+        else
+            error "Failed to download Valheim server from Steam - retrying later - check your networking and volume access permissions"
+            return
+        fi
+    fi
+    rsync -a --itemize-changes --delete --exclude server_exit.drp --exclude steamapps "$valheim_download_path/" "$valheim_install_path" | tee "$logfile"
+    if grep '^[*>]' "$logfile" > /dev/null 2>&1; then
+        info "Valheim Server was updated - restarting"
+        if ! check_mods updated; then
+            return
+        fi
+        write_restart_file updated
+    else
+        info "Valheim Server is already the latest version"
+        if ! check_mods uptodate; then
+            return
+        fi
+        if [ "$just_started" = true ]; then
+            write_restart_file just_started
+        fi
+    fi
+    just_started=false
+    rm -f "$logfile"
+    post_update_check_hook
+}
+
+
+check_mods() {
+    local valheim_server_update_status=$1
+    local ret=0
+    check_mod "$valheim_server_update_status" "ValheimPlus" "$VALHEIM_PLUS" "$vp_mergefile" "$vp_install_path" "$vp_updater"
+    local mod_vp_status=$?
+    check_mod "$valheim_server_update_status" "BepInEx" "$BEPINEX" "$bepinex_mergefile" "$bepinex_install_path" "$bepinex_updater"
+    local mod_bepinex_status=$?
+
+    if [ $mod_vp_status -ne 0 ] || [ $mod_bepinex_status -ne 0 ]; then
+        ret=1
+    fi
+    return $ret
+}
+
+
+check_mod() {
+    local valheim_server_update_status=$1
+    local mod_name=$2
+    local mod_enabled=$3
+    local mod_mergefile=$4
+    local mod_install_path=$5
+    local mod_updater=$6
+
+    if [ "$mod_enabled" = true ]; then
+        debug "$mod_name is enabled - running updater"
+        if [ "$valheim_server_update_status" = updated ]; then
+            info "Valheim Server was updated from Steam - signaling $mod_name updater to merge updated files"
+            touch "$mod_mergefile"
+        fi
+        if ! just_started=$just_started "$mod_updater"; then
+            error "Failed to run $mod_name updater - retrying later - check your networking and volume access permissions"
+            return 1
+        fi
+    else
+        if [ "$valheim_server_update_status" = updated ] && [ -d "$mod_install_path" ]; then
+            debug "$mod_name currently disabled but previously installed - keeping installation fresh"
+            debug "If this is unwanted remove $mod_install_path"
+            touch "$mod_mergefile"
+            if ! just_started=$just_started "$mod_updater"; then
+                error "Failed to run $mod_name updater - retrying later - check your networking and volume access permissions"
+                return 1
+            fi
+        fi
+    fi
+    return 0
+}
+
+
+download_valheim() {
+    # Kill any hung steamcmd processes
+    pkill -TERM steamcmd || true
+    sleep 1
+    pkill -KILL steamcmd || true
+    # shellcheck disable=SC2086
+    /opt/steamcmd/steamcmd.sh +force_install_dir "$valheim_download_path" +login anonymous +app_update 896660 $STEAMCMD_ARGS +quit
+}
+
+
+# This works around the `Unable to determine CPU Frequency. Try defining CPU_MHZ.` steamcmd issue (#184).
+verify_cpu_mhz() {
+    local float_regex
+    local cpu_mhz
+    float_regex="^([0-9]+\\.?[0-9]*)\$"
+    cpu_mhz=$(grep "^cpu MHz" /proc/cpuinfo | head -1 | cut -d : -f 2 | xargs)
+    if [ -n "$cpu_mhz" ] && [[ "$cpu_mhz" =~ $float_regex ]] && [ "${cpu_mhz%.*}" -gt 0 ]; then
+        debug "Found CPU with $cpu_mhz MHz"
+        unset CPU_MHZ
+    else
+        debug "Unable to determine CPU Frequency - setting a default of 1.5 GHz so steamcmd won't complain"
+        export CPU_MHZ="1500.000"
+    fi
+}
+
+
+verify_memory() {
+    local mem_info
+    local mem_total
+    local mem_min=4000000
+    mem_info=$(awk '
+        BEGIN {
+            total=0
+            free=0
+            available=0
+        }
+        {
+            if($1 ~ /^MemTotal/)
+                total=$2
+            else if($1 ~ /^MemFree/)
+                free=$2
+            else if($1 ~ /^MemAvailable/)
+                available=$2
+        }
+        END {
+            print total"/"free"/"available
+        }
+    ' /proc/meminfo)
+    debug "Memory total/free/available: $mem_info"
+    mem_total=${mem_info//\/*}
+    if [ "$mem_total" -lt $mem_min ]; then
+        mem_total=$(iec_size_format "$((mem_total*1024))")
+        error "$mem_total is not enough memory - read https://github.com/lloesche/valheim-server-docker#system-requirements"
+    fi
+}
+
+
+verify_storage() {
+    debug "Storage configuration:"
+    df -h | grep -v -E "^(tmpfs|shm)" | grep -v -E "(/sys/|/etc/|/run/)"
+    grep -v -E "^(proc|tmpfs|devpts|shm|mqueue|sysfs)" /etc/mtab | grep -v -E "(/sys/|/etc/|/run/)"
+}
+
+
+verify_kernel() {
+    debug "Kernel: $(uname -a)"
+}
+
+
+check_server_restart() {
+    local mode
+    # The control file $valheim_restartfile is either created
+    # by update() if Valheim is being installed for the first
+    # time or has been updated, or by valheim-plus-updater if
+    # a new version of the mod has been downloaded.
+    if [ -f "$valheim_restartfile" ]; then
+        mode=$(< "$valheim_restartfile")
+        rm -f "$valheim_restartfile"
+
+        case "$mode" in
+                start)
+                    if server_is_running; then
+                        debug "Valheim server is already running - no need to start it"
+                        return
+                    fi
+                    ;;
+                restart)
+                    if ! server_is_running; then
+                        mode=start
+                    fi
+                    ;;
+                *)
+                    mode=restart
+        esac
+
+        pre_hook "$mode"
+        supervisorctl "$mode" valheim-server
+        post_hook "$mode"
+    fi
+}
+
+
+is_idle() {
+    if [ "$UPDATE_IF_IDLE" = true ]; then
+        if [ "$just_started" = true ] && ! server_is_running; then
+            debug "Valheim updater was just started - skipping connected players check"
+            return 0
+        fi
+        if server_is_idle; then
+            debug "No players connected to Valheim server"
+            return 0
+        else
+            debug "Players connected to Valheim server - skipping update check"
+            return 1
+        fi
+
+    fi
+    return 0
+}
+
+
+pre_hook() {
+    local mode
+    mode=$1
+    if [ "$mode" = restart ] && [ -n "$PRE_RESTART_HOOK" ]; then
+        info "Running pre restart hook: $PRE_RESTART_HOOK"
+        eval "$PRE_RESTART_HOOK"
+    elif [ "$mode" = start ] && [ -n "$PRE_START_HOOK" ]; then
+        info "Running pre start hook: $PRE_START_HOOK"
+        eval "$PRE_START_HOOK"
+    fi
+}
+
+
+post_hook() {
+    local mode
+    mode=$1
+    if [ "$mode" = restart ] && [ -n "$POST_RESTART_HOOK" ]; then
+        info "Running post restart hook: $POST_RESTART_HOOK"
+        eval "$POST_RESTART_HOOK"
+    elif [ "$mode" = start ] && [ -n "$POST_START_HOOK" ]; then
+        info "Running post start hook: $POST_START_HOOK"
+        eval "$POST_START_HOOK"
+    fi
+}
+
+
+pre_update_check_hook() {
+    if [ -n "$PRE_UPDATE_CHECK_HOOK" ]; then
+        info "Running pre update check hook: $PRE_UPDATE_CHECK_HOOK"
+        eval "$PRE_UPDATE_CHECK_HOOK"
+    fi
+}
+
+
+post_update_check_hook() {
+    if [ -n "$POST_UPDATE_CHECK_HOOK" ]; then
+        info "Running post update check hook: $POST_UPDATE_CHECK_HOOK"
+        eval "$POST_UPDATE_CHECK_HOOK"
+    fi
+}
+
+
+# This is a signal handler registered to SIGHUP
+update_now() {
+    debug "Received signal to check for update"
+    next_update=0
+}
+
+
+shutdown() {
+    debug "Received signal to shut down valheim-updater"
+    clear_lock "$pidfile"
+    run=false
+}
+
+
+main

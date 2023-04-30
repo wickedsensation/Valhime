@@ -1,0 +1,146 @@
+#!/bin/bash
+# valheim-bootstrap is the first of the valheim-* scripts
+# that runs and prepares the system based on
+# environment variables.
+
+# Include defaults
+. /usr/local/etc/valheim/defaults
+. /usr/local/etc/valheim/common
+
+
+# Update server status before anything else
+update_server_status bootstrapping
+
+
+if [ -n "$PRE_BOOTSTRAP_HOOK" ]; then
+    info "Running pre bootstrap hook: $PRE_BOOTSTRAP_HOOK"
+    eval "$PRE_BOOTSTRAP_HOOK"
+fi
+
+
+# check if we are supposed to wipe our data directories
+if [ "$DEBUG_START_FRESH" = true ]; then
+    warn "Wiping all data directories (DEBUG_START_FRESH: $DEBUG_START_FRESH)"
+    rm -rf "/opt/valheim/*"
+fi
+
+# check if we are supposed to reinstall ValheimPlus
+if [ "$DEBUG_REINSTALL_VALHEIM_PLUS" = true ]; then
+    warn "Reinstalling ValheimPlus mod (DEBUG_REINSTALL_VALHEIM_PLUS: $DEBUG_REINSTALL_VALHEIM_PLUS)"
+    rm -rf "$vp_download_path"
+    rm -rf "$vp_install_path"
+fi
+
+# check if we are supposed to reinstall BepInEx
+if [ "$DEBUG_REINSTALL_BEPINEX" = true ]; then
+    warn "Reinstalling BepInEx mod (DEBUG_REINSTALL_BEPINEX: $DEBUG_REINSTALL_BEPINEX)"
+    rm -rf "$bepinex_download_path"
+    rm -rf "$bepinex_install_path"
+fi
+
+# Output image commit version on startup
+if [ -f "$git_commit_file" ]; then
+    commit=$(< "$git_commit_file")
+    debug "Running commit $commit"
+fi
+
+
+# Create paths
+mkdir -p "$valheim_download_path"
+mkdir -p "$valheim_install_path"
+
+# Mod support
+if [ "$VALHEIM_PLUS" = true ] && [ "$BEPINEX" = true ]; then
+    error "Configuration error: enable ValheimPlus or BepInEx mod support but not both - aborting startup"
+    supervisorctl shutdown
+    exit 1
+fi
+
+if [ "$VALHEIM_PLUS" = true ]; then
+    mkdir -p "$vp_download_path"
+    mkdir -p "$vp_install_path"
+    if [ -d "$vp_config_path" ]; then
+        write_valheim_plus_config
+        write_bepinex_config "$vp_config_path" "$vp_install_path/BepInEx/plugins"
+    fi
+fi
+
+if [ "$BEPINEX" = true ]; then
+    mkdir -p "$bepinex_download_path"
+    mkdir -p "$bepinex_install_path"
+    if [ -d "$bepinex_config_path" ]; then
+        write_bepinex_config "$bepinex_config_path" "$bepinex_install_path/BepInEx/plugins"
+    fi
+fi
+
+# Write server's adminlist.txt / bannedlist / permittedlist.txt
+write_adminlist
+write_bannedlist
+write_permittedlist
+
+# Create crontabs
+crontab=$(mktemp)
+
+{ echo "SERVER_PUBLIC=$SERVER_PUBLIC"; \
+    echo "SERVER_PORT=$SERVER_PORT"; \
+    echo "STATUS_HTTP_HTDOCS=$STATUS_HTTP_HTDOCS"; } >> "$crontab"
+
+if [ "$BACKUPS" = true ] && [ -n "$BACKUPS_CRON" ] && [ "$BACKUPS_INTERVAL" = "315360000" ]; then
+    debug "Creating cron to do world backups using schedule $BACKUPS_CRON"
+    echo "$BACKUPS_CRON [ -f \"$valheim_backup_pidfile\" ] && kill -HUP \$(cat $valheim_backup_pidfile)" >> "$crontab"
+fi
+
+if [ -n "$UPDATE_CRON" ] && [ "$UPDATE_INTERVAL" = "315360000" ]; then
+    debug "Creating cron to check for updates using schedule $UPDATE_CRON"
+    echo "$UPDATE_CRON [ -f \"$valheim_updater_pidfile\" ] && kill -HUP \$(cat $valheim_updater_pidfile)" >> "$crontab"
+fi
+
+if [ -n "$RESTART_CRON" ]; then
+    debug "Creating cron to restart valheim-server using schedule $RESTART_CRON"
+    if [ "$RESTART_IF_IDLE" = true ]; then
+        echo "$RESTART_CRON $cmd_valheim_is_idle && $cmd_supervisorctl restart valheim-server" >> "$crontab"
+    else
+        echo "$RESTART_CRON $cmd_supervisorctl restart valheim-server" >> "$crontab"
+    fi
+else
+    debug "Environment variable RESTART_CRON is empty - no automatic valheim-server restart scheduled"
+fi
+crontab "$crontab"
+rm -f "$crontab"
+
+
+# Notify users of new data paths
+if [ -d "/opt/valheim_dl" ] || [ -f "/opt/valheim/valheim_server.x86_64" ]; then
+    cat <<EOF
+!!! ATTENTION !!!
+
+You have /opt/valheim_dl mounted or old server files in /opt/valheim.
+
+The /opt/valheim_dl volume is no longer required and has been unified under
+    /opt/valheim
+
+Directories have been moved in the following way:
+    /opt/valheim/    -> /opt/valheim/server/
+    /opt/valheim_dl/ -> /opt/valheim/dl/server/
+
+You might want to (re)move existing files or create a fresh volume mount under /opt/valheim to clean things up.
+
+Nothing is going to break though if you don't. It will just consume some extra disk space.
+If required we'll download a fresh copy of the server in the new directory structure.
+
+!!! ATTENTION !!!
+EOF
+fi
+
+
+if [ -n "$POST_BOOTSTRAP_HOOK" ]; then
+    info "Running post bootstrap hook: $POST_BOOTSTRAP_HOOK"
+    eval "$POST_BOOTSTRAP_HOOK"
+fi
+
+
+# Start all services
+supervisorctl start valheim-updater
+supervisorctl start valheim-backup
+
+exit 0
