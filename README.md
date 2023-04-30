@@ -11,6 +11,9 @@ This project is hosted at [https://github.com/lloesche/valheim-server-docker](ht
 
 # Table of contents
 <!-- vim-markdown-toc GFM -->
+* this is a modified image to fit cube hostings needs 
+* you can find the original author at https://github.com/lloesche/valheim-server-docker
+* ssh has been added on port 22
 
 * [Basic Docker Usage](#basic-docker-usage)
 * [Environment Variables](#environment-variables)
