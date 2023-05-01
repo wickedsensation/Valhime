@@ -3,6 +3,8 @@
 * ssh has been added on port 22.
 * sync settings
 	* /config/worlds_local
+* to run use
+	* /launch.sh
 
 # lloesche/valheim-server Docker image
 ![Valheim](https://raw.githubusercontent.com/lloesche/valheim-server-docker/main/misc/Logo_valheim.png "Valheim")
