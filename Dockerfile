@@ -178,6 +178,8 @@ EXPOSE 80/tcp
 WORKDIR /
 #CMD ["/usr/local/sbin/bootstrap"]
 
+COPY launch.sh /launch.sh
+
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         openssh-server && \
